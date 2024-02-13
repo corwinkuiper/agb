@@ -141,14 +141,12 @@ static mut INTERRUPT_TABLE: [InterruptRoot; 14] = [
 ];
 
 #[no_mangle]
-extern "C" fn __RUST_INTERRUPT_HANDLER(interrupt: u16) -> u16 {
+extern "C" fn __RUST_INTERRUPT_HANDLER(interrupt: u16) {
     for (i, root) in unsafe { INTERRUPT_TABLE.iter().enumerate() } {
         if (1 << i) & interrupt != 0 {
             root.trigger_interrupts();
         }
     }
-
-    interrupt
 }
 
 struct InterruptInner {
@@ -180,7 +178,7 @@ impl Drop for InterruptInner {
         fn inner_drop(this: Pin<&mut InterruptInner>) {
             // drop the closure allocation safely
             let _closure_box =
-                unsafe { Box::from_raw(this.closure as *mut dyn Fn(&CriticalSection)) };
+                unsafe { Box::from_raw(this.closure as *mut dyn Fn(CriticalSection)) };
 
             // perform the rest of the drop sequence
             let root = unsafe { &*this.root };
@@ -299,6 +297,21 @@ unsafe impl critical_section::Impl for MyCriticalSection {
     }
 }
 
+pub fn interruptable<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let enabled = INTERRUPTS_ENABLED.get();
+
+    INTERRUPTS_ENABLED.set(1);
+
+    let r = f();
+
+    INTERRUPTS_ENABLED.set(enabled);
+
+    r
+}
+
 static NUM_VBLANKS: AtomicUsize = AtomicUsize::new(0); // overflows after 2.27 years
 static HAS_CREATED_INTERRUPT: AtomicBool = AtomicBool::new(false);
 
@@ -364,7 +377,7 @@ pub fn profiler(timer: &mut crate::timer::Timer, period: u16) -> InterruptHandle
 
 #[cfg(test)]
 mod tests {
-    use portable_atomic::AtomicU8;
+    use portable_atomic::{AtomicU32, AtomicU8};
 
     use super::*;
 
@@ -391,6 +404,66 @@ mod tests {
         for i in 0..=255 {
             ATOMIC.store(i, Ordering::SeqCst);
             assert_eq!(ATOMIC.load(Ordering::SeqCst), i);
+        }
+    }
+
+    #[test_case]
+    fn test_nested_interrupts(gba: &mut crate::Gba) {
+        let mut timers = gba.timers.timers();
+
+        let timer_a = &mut timers.timer2;
+        let timer_b = &mut timers.timer3;
+
+        timer_a.set_interrupt(true);
+        timer_a.set_overflow_amount(10000);
+
+        timer_b.set_interrupt(true);
+        timer_b.set_overflow_amount(15000);
+
+        static TIMER: AtomicU32 = AtomicU32::new(0);
+
+        let _interrupt_1 = unsafe {
+            add_interrupt_handler(timer_a.interrupt(), |_| {
+                interruptable(|| while TIMER.load(Ordering::SeqCst) == 0 {});
+
+                TIMER.store(2, Ordering::SeqCst);
+            })
+        };
+
+        let _interrupt_2 = unsafe {
+            add_interrupt_handler(timer_b.interrupt(), |_| {
+                TIMER.store(1, Ordering::SeqCst);
+            })
+        };
+
+        timer_b.set_enabled(true);
+        timer_a.set_enabled(true);
+
+        while TIMER.load(Ordering::SeqCst) != 2 {}
+    }
+
+    #[test_case]
+    fn setup_teardown_speed(gba: &mut crate::Gba) {
+        static TIMER: AtomicU32 = AtomicU32::new(0);
+        for _ in 0..100 {
+            TIMER.store(0, Ordering::SeqCst);
+
+            let timers = gba.timers.timers();
+
+            let mut timer_a = timers.timer2;
+
+            timer_a.set_interrupt(true);
+            timer_a.set_overflow_amount(10000);
+
+            timer_a.set_enabled(true);
+
+            let _interrupt_1 = unsafe {
+                add_interrupt_handler(timer_a.interrupt(), |_| {
+                    TIMER.store(1, Ordering::SeqCst);
+                })
+            };
+
+            while TIMER.load(Ordering::SeqCst) == 0 {}
         }
     }
 }
