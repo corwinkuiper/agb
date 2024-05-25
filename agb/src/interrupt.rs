@@ -1,4 +1,8 @@
-use core::{cell::Cell, marker::PhantomPinned, pin::Pin};
+use core::{
+    cell::{Cell, UnsafeCell},
+    marker::PhantomPinned,
+    pin::Pin,
+};
 
 use alloc::boxed::Box;
 use critical_section::{CriticalSection, RawRestoreState};
@@ -123,7 +127,11 @@ impl InterruptRoot {
     }
 }
 
-static mut INTERRUPT_TABLE: [InterruptRoot; 14] = [
+struct InterruptCell(UnsafeCell<[InterruptRoot; 14]>);
+
+unsafe impl Sync for InterruptCell {}
+
+static INTERRUPT_TABLE: InterruptCell = InterruptCell(UnsafeCell::new([
     InterruptRoot::new(Interrupt::VBlank),
     InterruptRoot::new(Interrupt::HBlank),
     InterruptRoot::new(Interrupt::VCounter),
@@ -138,11 +146,12 @@ static mut INTERRUPT_TABLE: [InterruptRoot; 14] = [
     InterruptRoot::new(Interrupt::Dma3),
     InterruptRoot::new(Interrupt::Keypad),
     InterruptRoot::new(Interrupt::Gamepak),
-];
+]));
 
 #[no_mangle]
 extern "C" fn __RUST_INTERRUPT_HANDLER(interrupt: u16) {
-    for (i, root) in unsafe { INTERRUPT_TABLE.iter().enumerate() } {
+    let table: &[InterruptRoot; 14] = unsafe { &*(INTERRUPT_TABLE.0.get() as *const _) };
+    for (i, root) in table.iter().enumerate() {
         if (1 << i) & interrupt != 0 {
             root.trigger_interrupts();
         }
@@ -218,7 +227,8 @@ impl InterruptRoot {
 }
 
 fn interrupt_to_root(interrupt: Interrupt) -> &'static InterruptRoot {
-    unsafe { &INTERRUPT_TABLE[interrupt as usize] }
+    let table = unsafe { &*(INTERRUPT_TABLE.0.get()) };
+    &table[interrupt as usize]
 }
 
 #[must_use]
@@ -363,7 +373,7 @@ mod tests {
     #[test_case]
     fn test_interrupt_table_length(_gba: &mut crate::Gba) {
         assert_eq!(
-            unsafe { INTERRUPT_TABLE.len() },
+            unsafe { (*INTERRUPT_TABLE.0.get()).len() },
             Interrupt::Gamepak as usize + 1,
             "interrupt table should be able to store gamepak interrupt"
         );
